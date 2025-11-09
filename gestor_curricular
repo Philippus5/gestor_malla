@@ -1,0 +1,251 @@
+#Gestor Curricular 
+
+import io
+from collections import defaultdict, deque
+from pathlib import Path
+import pandas as pd
+import streamlit as st 
+
+st.set_page_config(page_title="Gestor Curricular", layout="wide")
+st.title("Gestor Curricular")
+
+# ------------------------- Carga de malla -------------------------
+@st.cache_data
+def load_df(file) -> pd.DataFrame:
+    df = pd.read_csv(file, dtype=str).fillna("")
+    needed = ["name", "credits", "prereq"]
+    miss = [c for c in needed if c not in df.columns]
+    if miss:
+        raise ValueError(f"Faltan columnas: {miss} (requeridas: {needed})")
+    df["name"] = df["name"].str.strip()
+    df["credits"] = pd.to_numeric(df["credits"], errors="coerce").fillna(0).astype(int)
+    df["prereq"] = df["prereq"].str.strip()
+    return df
+
+def example_df():
+    data = io.StringIO("""name,credits,prereq
+Introducción al Derecho I,5,ninguno, 
+Introducción al Derecho II,5,Introducción al Derecho I,
+Derecho Constitucional I,6,Introducción al Derecho II              
+""")
+    return load_df(data)
+
+with st.sidebar:
+    st.header("Malla")
+    up = st.file_uploader("Sube malla (CSV name,credits,prereq)", type=["csv"])
+    if st.button("Usar ejemplo"):
+        df = example_df()
+    elif up:
+        df = load_df(up)
+    else:
+        df = example_df()
+    st.write("Ramos:", len(df))
+
+NAME = dict(zip(df["name"]))
+CRED = dict(zip(df["credits"]))
+
+def split_pr(s: str) -> list[str]:
+    s = (s or "").strip()
+    return [x.strip() for x in s.split(";") if x.strip()] if s else []
+
+PREREQS = {r.code: set(split_pr(r.prereq)) for r in df.itertuples()}
+DEPENDENTS = defaultdict(set)
+for c, reqs in PREREQS.items():
+    for r in reqs:
+        DEPENDENTS[r].add(c)
+
+# ------------------------- Estado: semestres & resultados -------------------------
+if "approved" not in st.session_state:
+    st.session_state.approved = set()  # ramos ya aprobados en el historial
+if "current_sem" not in st.session_state:
+    st.session_state.current_sem = set()  # ramos que se intentan este semestre
+if "outcomes" not in st.session_state:
+    st.session_state.outcomes = dict()  # code -> "Aprobado/Reprobado/Retiro/No tomado"
+
+# Helpers
+OUTCOME_OPTIONS = ["Aprobado", "Reprobado", "Retiro", "No tomado"]
+
+def prereqs_ok(code: str, passed: set[str]) -> bool:
+    return PREREQS.get(code, set()).issubset(passed)
+
+def available_next_sem(passed: set[str], already_planned: set[str]) -> list[str]:
+    # Ramos cuyos prerrequisitos están cumplidos y que no están ya aprobados ni planificados/intentados
+    avail = []
+    for c in NAME:
+        if c in passed or c in already_planned:
+            continue
+        if prereqs_ok(c, passed):
+            avail.append(c)
+    return sorted(avail)
+
+def blocked_reasons(passed: set[str]) -> list[str]:
+    msgs = []
+    for c in NAME:
+        if c in passed:
+            continue
+        reqs = PREREQS.get(c, set())
+        missing = sorted([r for r in reqs if r not in passed])
+        if missing:
+            msgs.append(f"{c} — falta(n) {missing}")
+    return msgs
+
+def topo_levels(remaining: set[str], passed: set[str]) -> dict[str,int]:
+    """
+    Asigna un 'nivel' topológico: el mínimo número de pasos (semestres) necesarios
+    suponiendo que se pueden tomar TODOS los que cumplan prerrequisitos en cada paso.
+    Útil para ver qué tan lejos quedan algunos ramos.
+    """
+    unmet = {c for c in remaining if c not in passed}
+    level = {}
+    frontier = {c for c in unmet if prereqs_ok(c, passed)}
+    k = 0
+    p = set(passed)
+    while frontier:
+        for c in frontier:
+            level[c] = k
+        p = p.union(frontier)
+        unmet = unmet - frontier
+        frontier = {c for c in unmet if prereqs_ok(c, p)}
+        k += 1
+    # Los que nunca entraron a frontier tienen ciclo o dependen de imposibles
+    for c in unmet:
+        level[c] = 10**9
+    return level
+
+def auto_schedule(passed: set[str], max_credits: int, horizon: int = 8) -> list[list[str]]:
+    """
+    Planificador codicioso por semestres:
+    En cada semestre, toma todos los cursos disponibles (prerrequisitos OK)
+    hasta completar el tope de créditos 'max_credits'.
+    """
+    plan = []
+    taken = set(passed)
+    remaining = [c for c in NAME if c not in taken]
+    for _ in range(horizon):
+        avail = [c for c in remaining if prereqs_ok(c, taken)]
+        if not avail:
+            break
+        # Heurística: priorizar los que desbloquean más dependientes (grado de salida)
+        avail.sort(key=lambda c: (-len(DEPENDENTS.get(c, [])), CRED.get(c, 0)))
+        sem, used = [], 0
+        for c in avail:
+            cr = CRED.get(c, 0)
+            if used + cr <= max_credits:
+                sem.append(c)
+                used += cr
+        if not sem:
+            break
+        plan.append(sem)
+        taken.update(sem)
+        remaining = [c for c in remaining if c not in sem]
+        if not remaining:
+            break
+    return plan
+
+# ------------------------- UI: construir semestre actual -------------------------
+st.subheader("1) Semestre actual")
+col1, col2 = st.columns([2,1])
+with col1:
+    add = st.selectbox("Agregar ramo al semestre actual", ["(elige)"] + sorted([c for c in NAME if c not in st.session_state.current_sem and c not in st.session_state.approved]))
+    if st.button("Agregar"):
+        if add != "(elige)":
+            st.session_state.current_sem.add(add)
+with col2:
+    if st.button("Limpiar semestre actual"):
+        st.session_state.current_sem.clear()
+        st.session_state.outcomes.clear()
+
+if st.session_state.current_sem:
+    st.markdown("**Ramos del semestre actual (define el resultado):**")
+    for c in sorted(st.session_state.current_sem):
+        prev = st.session_state.outcomes.get(c, "No tomado")
+        st.session_state.outcomes[c] = st.selectbox(
+            f"{c} — {NAME[c]} ({CRED[c]} cr)",
+            OUTCOME_OPTIONS, index=OUTCOME_OPTIONS.index(prev), key=f"out_{c}"
+        )
+else:
+    st.info("Agrega ramos al semestre actual (arriba).")
+
+# ------------------------- Procesar resultados (what-if) -------------------------
+st.subheader("2) Procesar resultados del semestre")
+if st.button("Aplicar resultados a la malla"):
+    # Aprobados nuevos = los marcados Aprobado; Reprobado/Retiro/No tomado no suman
+    new_pass = {c for c, o in st.session_state.outcomes.items() if o == "Aprobado"}
+    st.session_state.approved.update(new_pass)
+    st.success(f"Se registraron {len(new_pass)} ramos aprobados este semestre.")
+    # Todo semestre "actual" se vacía tras procesar (simulamos fin de semestre)
+    st.session_state.current_sem.clear()
+    st.session_state.outcomes.clear()
+
+# ------------------------- Diagnóstico post-semestre -------------------------
+st.subheader("3) Opciones para el próximo semestre")
+
+aprobados = sorted(st.session_state.approved)
+st.markdown(f"**Aprobados acumulados ({len(aprobados)}):** " + (", ".join(aprobados) if aprobados else "—"))
+
+# Disponibles el próximo semestre (prerrequisitos cumplidos con aprobados acumulados)
+disponibles = available_next_sem(set(aprobados), already_planned=set())
+st.markdown(f"**Ramos disponibles el próximo semestre ({len(disponibles)}):** " + (", ".join(disponibles) if disponibles else "—"))
+
+# Bloqueados y razones
+st.markdown("**Ramos bloqueados (faltan prerrequisitos):**")
+bloq_msgs = blocked_reasons(set(aprobados))
+if bloq_msgs:
+    for m in sorted(bloq_msgs):
+        st.write("• " + m)
+else:
+    st.write("—")
+
+# Qué ramos quedaron imposibilitados por reprobar/retirar/no tomar
+# (explicación granular: si faltó X, quiénes dependen de X)
+st.markdown("**Efecto en dependientes por ramos no aprobados:**")
+no_aprob = set(NAME) - set(aprobados)
+explicados = 0
+for x in sorted(no_aprob):
+    # Si este ramo es prerrequisito de otros, listar los afectados
+    deps = sorted(DEPENDENTS.get(x, []))
+    if deps:
+        st.write(f"• Al no aprobar {x}, quedan detenidos: {deps}")
+        explicados += 1
+if not explicados:
+    st.write("—")
+
+# Distancia mínima (en semestres) a algunos ramos clave
+st.markdown("**Distancia mínima (semestres) a completar ramos restantes:**")
+levels = topo_levels(set(NAME), set(aprobados))
+ej = sorted([c for c in NAME if c not in aprobados])[:10]
+for c in ej:
+    L = levels.get(c, 10**9)
+    st.write(f"• {c}: { 'inalcanzable (ciclo o requisito imposible)' if L>=10**9 else f'{L} semestre(s) mínimos'}")
+
+# ------------------------- Autoplan de recuperación -------------------------
+st.subheader("4) Autoplan sugerido (recuperación)")
+max_cr = st.number_input("Tope de créditos por semestre", min_value=6, max_value=40, value=24, step=1)
+if st.button("Generar plan de recuperación"):
+    plan = auto_schedule(set(aprobados), max_credits=int(max_cr), horizon=12)
+    if not plan:
+        st.warning("No se pudo generar un plan (puede que falten requisitos base o la malla ya esté completa).")
+    else:
+        total_cr = 0
+        for i, sem in enumerate(plan, start=1):
+            cr = sum(CRED[c] for c in sem)
+            total_cr += cr
+            st.markdown(f"**Semestre +{i}** ({cr} cr): " + ", ".join(f"{c}" for c in sem))
+        faltantes = [c for c in NAME if c not in aprobados and all(c not in s for s in plan)]
+        if faltantes:
+            st.info("Ramos que quedaron fuera (por tope de créditos u orden): " + ", ".join(faltantes))
+        st.success(f"Créditos cubiertos en el plan sugerido: {total_cr}")
+
+# ------------------------- Utilidades -------------------------
+st.divider()
+c1, c2, c3 = st.columns(3)
+with c1:
+    if st.button("Marcar todo como no aprobado (reset aprobados)"):
+        st.session_state.approved = set()
+with c2:
+    if st.button("Exportar aprobados a CSV"):
+        out = pd.DataFrame(sorted(st.session_state.approved), columns=["code"])
+        p = Path("aprobados.csv"); out.to_csv(p, index=False, encoding="utf-8")
+        st.success("Exportado como aprobados.csv")
+with c3:
+    st.caption("Tip: puedes subir otra malla o ajustar los créditos máximos.")
